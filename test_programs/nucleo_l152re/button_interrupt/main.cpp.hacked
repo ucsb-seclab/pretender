@@ -1,0 +1,28 @@
+#include "mbed.h"
+
+InterruptIn button(USER_BUTTON);
+
+Serial pc(SERIAL_TX, SERIAL_RX);
+
+
+void pressed()
+{
+    pc.printf("up\r\n");
+}
+
+void released()
+{
+    pc.printf("down\r\n");
+}
+
+int main()
+{
+    // Assign functions to button
+    button.fall(&pressed);
+    button.rise(&released);
+
+    while (1) {
+        //led = !led;
+        //wait(delay);
+    }
+}

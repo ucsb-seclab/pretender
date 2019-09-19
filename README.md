@@ -7,9 +7,11 @@ You can read the paper here: http://subwire.net/publication/pretender/
 
 ## What's included:
 
-*python-pretender*: the source code of the Pretender python module.
-*test_programs*: A corpus of test programs, for different boards
-*examples*: Some handy scripts showing how to run Pretender
+* *python-pretender*: the source code of the Pretender python module.
+
+* *test_programs*: A corpus of test programs, for different boards
+
+- *examples*: Some handy scripts showing how to run Pretender
 
 ## Setup:
 

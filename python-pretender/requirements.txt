@@ -1,0 +1,7 @@
+avatar2
+PyYAML
+pyserial
+statsmodels
+numpy
+scipy
+scikit-learn

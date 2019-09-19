@@ -1,0 +1,287 @@
+#!/usr/bin/env python
+# Native
+import argparse
+import os
+import pprint
+
+from avatar2 import *
+
+import logging
+
+from pretender.logger import LogWriter
+from pretender.bin_parser import M3Parser
+from pretender.coverage import get_hit_blocks
+from pretender.common import *
+from pretender.hooks import *
+
+import pretender.globals as G
+import itertools
+from pretender.metrics.survivability import *
+
+logger = logging.getLogger(__name__)
+
+
+def set_memory_map_modeled(avatar, args, model):
+    qemu = avatar.get_target('qemu')
+    hardware = None
+    try:
+        hardware = avatar.get_target('hardware')
+    except:
+        l.info("No hardware present")
+
+    if not os.path.exists(os.path.join(args.output_dir)):
+        l.error("No model file found (%s).  Make sure you "
+                "trained a model!" % model_file)
+        sys.exit()
+    # Setup our memory regions
+    l.warn("Adding memory ranges")
+    if args.memory_map:
+        for region, params in args.memory_map.items():
+            base = params['base']
+            size = params['size']
+            forwarded = params['forwarded']
+            l.info("%s: %s" % (region, repr(params)))
+            if region == 'mmio':
+                # Decide whether we're doing modeling, forwarding, or neither
+                # No model at all
+                if args.no_model:
+                    pass
+                # The null model
+                elif args.null_model:
+                    mmio = avatar.add_memory_range(base, size, name='mmio',
+                                                   emulate=NullModel, kwargs={})
+                # A partial model, used to record interrupts
+                elif args.partial_model:
+                    add_partial_model(avatar, qemu, hardware,
+                                      args.partial_model, base=base, size=size)
+                    continue
+                # The real deal model
+                elif model:
+                    model.send_interrupts_to(qemu)
+                    mmio = avatar.add_memory_range(base, size, name='mmio',
+                                                   forwarded=True,
+                                                   forwarded_to=Pretender(
+                                                       "Pretender", base,
+                                                       size,
+                                                       model))
+
+                else:
+                    avatar.add_memory_range(base, size, name=region,
+                                            forwarded=forwarded,
+                                            forwarded_to=hardware)
+            # If this is the ROM, we need to put the actual firmware in!
+            elif region == 'rom':
+                avatar.add_memory_range(base, size, name=region,
+                                        forwarded=forwarded,
+                                        forwarded_to=hardware, file=args.sample)
+            else:
+                avatar.add_memory_range(base, size, name=region,
+                                        forwarded=forwarded,
+                                        forwarded_to=hardware)
+    else:
+        l.critical("Using default mem map, is that what you want??")
+        ivt = avatar.add_memory_range(0, 0x1000)
+        if args.partial_model:
+            add_partial_model(avatar, qemu, hardware, args.partial_model,
+                              base=0x40000000, size=0x10000000)
+        else:
+            mmio = avatar.add_memory_range(0x40000000, 0x10000000, name='mmio',
+                                           forwarded=True,
+                                           forwarded_to=hardware)
+        rom = avatar.add_memory_range(0x08000000, 0x80000, name='rom',
+                                      file=args.sample)
+        ram = avatar.add_memory_range(0x20000000, 0x00019000, name='ram')
+
+
+def parse_args():
+    # Default argument values
+    sample = "firmware/Nucleo_blink_led.bin"
+    openocd_conf = '/usr/share/openocd/scripts/board/st_nucleo_l1.cfg'
+    output_dir = 'comparison_logs'
+    qemu_executable = os.path.join(os.path.dirname(__file__),
+                                   "../../avatar2-pretender/targets/build/qemu/arm-softmmu/qemu-system-arm")
+    gdb_port = 1235
+    qemu_port = 23454
+
+    # Get user input
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--board-config", "-b", help="Board config file YAML")
+    parser.add_argument('--coverage', '-C', action='store_true',
+                        help="Calculate block coverage from QEMU data")
+    parser.add_argument('--proto', help="Select Avatar protocol to use",
+                        choices=('openocd', 'gdb', 'jlink'),
+                        default='openocd')
+    parser.add_argument("-A", "--all", dest='all', action='store_true',
+                        help="Merge all models")
+    parser.add_argument("--sample", "-s", default=sample,
+                        help="Binary being analyzed.")
+    parser.add_argument("--openocd_conf", "-c", default=openocd_conf,
+                        help="OpenOCD config file.")
+    # parser.add_argument("--output_dir", "-o", default=output_dir,
+    #                     help="Output directory for logging.")
+    parser.add_argument("--gdb_port", "-g", default=gdb_port,
+                        help="GDB port number.")
+    parser.add_argument('--serial', action='store_true',
+                        help="Enable serial USART on port 5656")
+
+    parser.add_argument("--qemu_executable", "-x", default=qemu_executable,
+                        help="QEMU Executable.")
+    parser.add_argument("--qemu_port", "-q", default=qemu_port,
+                        help="QEMU Port.")
+    parser.add_argument("--debug", "-d", default=False, action='store_true',
+                        help="QEMU Port.")
+    parser.add_argument('--interrupts', '-I', action='store_true',
+                        help="Enable interrupt recording mode via stub injection")
+    parser.add_argument("--no-model", dest='no_model', action="store_true")
+    parser.add_argument("--null-model", dest="null_model", action="store_true")
+    parser.add_argument('--shell', help="Enable IPython shell",
+                        action='store_true')
+    parser.add_argument('--vomit', "-V", action='store_true',
+                        help="Enable the vomit log from QEMU")
+    parser.add_argument("--recording_dir", "-r", default="recording",
+                        help="Directory containing pickled model.")
+    parser.add_argument("--output_file", "-O", default="emulated_output.csv",
+                        help="File to save recorded MMIO to.")
+    parser.add_argument("--sleep_time", "-t", default=120,
+                        help="Time to sleep before killing Avatar. [default: "
+                             "120 s]")
+    args = parser.parse_args()
+    args.output_dir = args.recording_dir
+    args.memory_map = None
+    args.partial_model = None
+
+    # Do all of our checks!
+    if not os.path.exists(args.sample):
+        print("Sample file (%s) does not exist." % args.sample)
+        sys.exit()
+
+    if not os.path.exists(args.qemu_executable):
+        print("QEMU executable (%s) does not exist." % args.qemu_executable)
+        sys.exit()
+
+    if not os.path.exists(args.output_dir):
+        l.error("Recording directory does not exist (%s)." %
+                args.output_dir)
+        parser.print_help()
+        sys.exit()
+
+    return args
+
+
+def set_emulate_hooks(avatar, args):
+    # Monitor memory reads to forwarded MMIO
+    # l.warning("Adding watchmen")
+    avatar.watchmen.add_watchman('RemoteMemoryWrite', 'after',
+                                 emulate_write_after)
+    avatar.watchmen.add_watchman('RemoteMemoryRead', 'after',
+                                 emulate_read_after)
+    # avatar.watchmen.add_watchman('RemoteMemoryWrite', 'before',
+    #                              print_write_before)
+    # avatar.watchmen.add_watchman('RemoteMemoryRead', 'before',
+    #                              print_read_before)
+    if args.interrupts:
+        #qemu.protocols.interrupts.enable_interrupts()
+        avatar.enable_interrupts(None, qemu, semi_forwarding=True)
+        l.info("Registering interrupt handlers")
+        avatar.watchmen.add_watchman('RemoteInterruptEnter', 'after',
+                                     emulate_interrupt_enter)
+        avatar.watchmen.add_watchman('RemoteInterruptExit', 'after',
+                                     emulate_interrupt_exit)
+        # avatar.enable_interrupts(nucleo, qemu)
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    args = load_config(args)
+
+    # Setup Logging
+    logging.basicConfig()
+    l = logging.getLogger()
+    if args.debug:
+        l.setLevel(logging.DEBUG)
+    else:
+        l.setLevel(logging.INFO)
+
+    # Setup our binary parser
+    # TODO: Abstract this.
+    bin_parser = M3Parser(args.sample)
+
+    l.warning("Beginning iterative training....")
+    model_file = os.path.join(args.output_dir, G.MODEL_FILE)
+    kwargs = {}
+    # Note, this doesn't work with interrupts right now, fixme!
+    pretender_model = PretenderModel(filename=model_file, **kwargs)
+    all_periphs = pretender_model.get_peripherals()
+    collapsed = []
+    uncollapsed = all_periphs
+    best_run = None
+    best_run_output = None
+    x = 0
+    args.original_output_dir = args.output_dir
+
+    optimized_output_dir = os.path.join(args.output_dir, "optimized")
+    try:
+        os.mkdir(optimized_output_dir)
+    except:
+        pass
+    while uncollapsed:
+        # Let's try collapsing a peripheral
+        if x > 0:
+            # Do it the first time, no collapses
+            candidate = uncollapsed.pop()
+            candidate.collapse()
+            l.info("Collapsing %s" % repr(candidate))
+
+        if args.all:
+            pretender_model.collapse_all()
+        # Now do it.
+        args.output_dir = os.path.join(args.original_output_dir, "train_%d" % x)
+        args.recording_dir = args.output_dir
+        x += 1
+        # Let's setup avatar
+        avatar = build_avatar(args, emulate=True)
+        qemu = build_emulator(avatar, args)
+        set_memory_map_modeled(avatar, args, model=pretender_model)
+
+        # Init our targets
+        l.warn("Init targets")
+        avatar.init_targets()
+
+        # Set our output file
+        G.OUTPUT_TSV = LogWriter(
+            os.path.join(args.output_dir, args.output_file))
+        set_emulate_hooks(avatar, args)
+
+        qemu.regs.pc = bin_parser.get_entry_point()
+        qemu.regs.sp = bin_parser.get_initial_sp()
+        if args.shell:
+            import IPython;
+
+            IPython.embed()
+        else:
+
+            qemu.cont()
+
+            l.info("Running for a bit...")
+            time.sleep(args.sleep_time)
+            print("Time's up! Stopping everything")
+
+        qemu.stop()
+        print("Shutting down Avatar...")
+        avatar.shutdown()
+        if args.all:
+            break
+        # How'd we do?
+        if best_run_output:
+            score = survivability(args.sample, best_run_output, args.output_dir)
+            if score >= best_run:
+                l.info("New high score! %d from %s")
+                best_run = score
+                best_run_output = args.recording_dir
+                collapsed.append(candidate)
+            else:
+                l.info("Aw we fucked up, score: %d" % score)
+                candidate.expand()
+        else:
+            best_run_output = args.recording_dir
+    pretender_model.save(optimized_output_dir)

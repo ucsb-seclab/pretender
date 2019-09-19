@@ -1,0 +1,9 @@
+proto: "openocd"
+openocd_conf: "/usr/share/openocd/scripts/board/st_nucleo_f0.cfg"
+ivt_address: 0x20000000
+ivt_unlock: [0x40010000, 3]
+memory_map:
+    ivt: {"base" : 0x00000000, "size" : 0x00001000,  "forwarded" : false}
+    rom: {"base" : 0x08000000, "size" : 0x00080000,  "forwarded" : false}
+    ram: {"base" : 0x20000000, "size" : 0x00019000,  "forwarded" : false}
+    mmio: {"base" : 0x40000000, "size" : 0x10000000,  "forwarded" : true}

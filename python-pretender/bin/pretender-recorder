@@ -1,0 +1,323 @@
+#!/usr/bin/env python
+# Native
+import argparse
+import os
+from time import sleep
+import importlib
+from avatar2 import *
+from avatar2.targets.jlink_target import JLinkTarget
+import logging
+import pickle
+
+import pretender
+from pretender.bin_parser import M3Parser
+from pretender.logger import LogWriter
+from pretender.coverage import get_hit_blocks
+from pretender.common import *
+
+l = logging.getLogger("pretender-recorder")
+
+# A few globals
+seq = 0
+memory_log = None
+time_start = None
+
+
+def record_read_after(avatar, message, **kwargs):
+    """
+    prints our read message
+    see avatar.ui.message.py
+    """
+    global seq, memory_log, time_start
+    _, val, success = kwargs['watched_return']
+
+    if not message.dst or 'model' in message.dst.name:
+        l.debug("IGNR:  %s (%s, %s) @ %s" % (message, hex(message.address), val,
+                                             hex(message.pc)))
+    else:
+        l.debug("READ:  %s (%s, %s) @ %s" % (message, hex(message.address), val,
+                                             hex(message.pc)))
+        memory_log.write_row(
+            ['READ', seq, message.address, val, message.pc, message.size,
+             time.time() - time_start])
+        # pprint.pprint(kwargs)
+        seq += 1
+
+
+def record_write_after(avatar, message, **kwargs):
+    """
+    prints our write message
+    see avatar.ui.message.py
+    """
+    global seq, memory_log, time_start
+    _, val, success = kwargs['watched_return']
+    if not message.dst or "model" in message.dst.name:
+        l.debug("IGNW %s (%s,%s) @ %s" % (message, hex(message.address),
+                                          message.value, hex(message.pc)))
+    else:
+        l.debug("WRITE %s (%s,%s) @ %s" % (message, hex(message.address),
+                                           message.value, hex(message.pc)))
+        memory_log.write_row(
+            ['WRITE', seq, message.address, message.value, message.pc,
+             message.size, time.time() - time_start])
+        # pprint.pprint(kwargs)
+        seq += 1
+
+
+def record_interrupt_enter(avatar, message, **kwargs):
+    global seq, memory_log, time_start
+    # message.origin.wait()
+    # isr = message.origin.protocols.interrupts.get_current_isr_num()
+    isr = message.interrupt_num
+    # TODO: Fill this out with something more intelligent
+    memory_log.write_row(['ENTER', seq, isr, 0, 0, 0, time.time() - time_start])
+    l.warning \
+        ("ENTER %s %s" % (hex(isr), message))
+    seq += 1
+
+
+def record_interrupt_exit(avatar, message, **kwargs):
+    global seq, memory_log, time_start
+    # TODO: Fill this out with something more intelligent
+
+    isr = message.interrupt_num
+    memory_log.write_row(['EXIT', seq, isr, 0, 0, 0, time.time() - time_start])
+    l.warning("EXIT %s %s" % (hex(isr), message))
+    seq += 1
+
+
+def record_interrupt_return(avatar, message, **kwargs):
+    global seq, memory_log, time_start
+    # TODO: Actually make this work, return is different from exit
+    # TODO: Fill this out with something more intelligent
+    memory_log.write_row(
+        ['EXIT', message.id, isr, 0, 0, 0, time.time() - time_start])
+    l.debug("RETURN %s %s" % (hex(isr), message))
+
+
+def parse_args():
+    # Default argument values
+    default_sample = "bins/Nucleo_blink_led.bin"
+    openocd_conf = '/usr/share/openocd/scripts/board/st_nucleo_l1.cfg'
+    output_dir = 'recording'
+    qemu_executable = os.path.join(os.path.dirname(__file__),
+                                   "../../avatar2-pretender/targets/build/qemu" \
+                                   "/arm-softmmu/qemu-system-arm")
+    gdb_port = 1235
+    qemu_port = 23454
+
+    # Get user input
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample", "-s", default=default_sample,
+                        help="Binary being analyzed.")
+    parser.add_argument("--board-config", help="Board config file YAML")
+    parser.add_argument("--openocd_conf", "-c", default=openocd_conf,
+                        help="OpenOCD config file.")
+    parser.add_argument("--output_dir", "-o", default=output_dir,
+                        help="Output directory for logging.")
+    parser.add_argument("--gdb_port", "-g", default=gdb_port,
+                        help="GDB port number.")
+    parser.add_argument("--qemu_executable", "-x", default=qemu_executable,
+                        help="QEMU Executable.")
+    parser.add_argument("--qemu_port", "-q", default=qemu_port,
+                        help="QEMU Port.")
+    parser.add_argument("--debug", "-d", default=False, action='store_true',
+                        help="Enable debug output.")
+    parser.add_argument('--proto', help="Select Avatar protocol to use",
+                        choices=('openocd', 'gdb', 'jlink'), default='openocd')
+    parser.add_argument('--coverage', '-C', default=False, action='store_true',
+                        help="Generate QEMU block coverage info")
+    parser.add_argument('--interrupts', '-I', action='store_true',
+                        help="Enable interrupt recording mode via stub injection")
+    parser.add_argument('--board', '-b', default=0,
+                        type=int,
+                        help="Which board # to reset on the YKUSH.  Defaults to 0 (don't reset the board")
+    parser.add_argument('--partial-model', '-P', dest='partial_model',
+                        help="Enable partial modeling with the selected model.  Will find the sub-models that look cool, and use those instead of forwarding")
+    # parser.add_argument("--logfile", "-l", default="memory.log",
+    #                     help="Input log of memory accesses.")
+    parser.add_argument('--stimulator', '-S',
+                        help="Program to run to stimulate the target")
+    parser.add_argument("--runs", "-r", default=1, type=int,
+                        help="Number of times to run and record the firmware.")
+    parser.add_argument("--sleep_time", "-t", default=120,
+                        help="Time to sleep before killing Avatar. [default: "
+                             "120 s]")
+    parser.add_argument("--quiet", "-Q", action='store_true',
+                        help="Quiet mode.")
+    parser.add_argument('--shell', help="Drop to ipython shell",
+                        action='store_true')
+    parser.add_argument('--vomit', "-V", action='store_true',
+                        help="Enable the vomit log from QEMU")
+    args = parser.parse_args()
+    args.memory_map = None
+    args.no_model = None
+    args.null_model = None
+    args.ivt_address = None
+    args.ivt_unlock = None
+    # Do all of our checks!
+    args.sample = os.path.abspath(args.sample)
+    if not os.path.exists(args.sample):
+        print("Sample file (%s) does not exist." % args.sample)
+        sys.exit()
+
+    if not os.path.exists(args.qemu_executable):
+        print("QEMU executable (%s) does not exist." % args.qemu_executable)
+        sys.exit()
+    return args
+
+
+def set_record_hooks(avatar, args):
+    global memory_log
+    # Reset our sequence number
+    pretender.hooks.seq = 0
+
+    # Get QEMU instance
+    qemu = avatar.get_target('qemu')
+    hardware = None
+    try:
+        hardware = avatar.get_target('hardware')
+    except:
+        l.exception("No hardware detected.")
+
+    # Monitor memory reads to forwarded MMIO
+    l.warning("Adding watchmen")
+    avatar.watchmen.add_watchman('RemoteMemoryWrite', 'after',
+                                 record_write_after)
+    avatar.watchmen.add_watchman('RemoteMemoryRead', 'after',
+                                 record_read_after)
+
+    # Are we recording interrupts?
+    if args.interrupts:
+        l.info("Registering interrupt handlers")
+        avatar.watchmen.add_watchman('RemoteInterruptEnter', 'after',
+                                     record_interrupt_enter)
+        avatar.watchmen.add_watchman('RemoteInterruptExit', 'after',
+                                     record_interrupt_exit)
+        # import IPython; IPython.embed()
+        rom = filter(lambda x: x.name == 'rom', [r.data for r in
+                                                 avatar.memory_ranges])[0]
+        avatar.forward_instructions(qemu, hardware, rom)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    args = load_config(args)
+    # Setup Logging
+    logging.basicConfig()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        l.setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+        l.setLevel(logging.WARNING)
+    else:
+        l.setLevel(logging.INFO)
+
+    # Setup our binary parser
+    # TODO: abstract this!
+    bin_parser = M3Parser(args.sample)
+
+    stim_proc = None
+
+    for run in range(args.runs):
+        if args.board:
+            l.warning("Resetting board %d" % args.board)
+            reset_board(args.board)
+        #
+        # The usual setup
+        #
+        avatar = build_avatar(args)
+        qemu = build_emulator(avatar, args)
+        hardware = build_hardware(avatar, args)
+        set_memory_map(avatar, args, model=False)
+
+        # Init our targets
+        l.warn("Init targets")
+        avatar.init_targets()
+        set_record_hooks(avatar, args)
+
+        #
+        # recording-specific setup
+        #
+        stim_proc = None
+        if args.stimulator:
+            # Load the stimulator out of the library
+            Stimulator = getattr(
+                importlib.import_module("pretender.stimulators"),
+                args.stimulator)
+            stim_proc = Stimulator()
+            stim_proc.start()
+            stim_proc.wait_for_connection()
+        if args.interrupts:
+            # NOTE: On the nordic, we can't write the stub in unless we twiddle some bits first!
+            #hardware.write_memory(0x4001e504, 4, 2) # Get ready to get violent
+            #hardware.write_memory(0x4001e508, 4, 0)
+            #hardware.write_memory(0x4001e508, 4, 1) # Blow the IVT to smitherines
+            #hardware.write_memory(0x4001e504, 4, 1) # Get ready to write a new one
+            #hardware.write_memory(0x0, 4, 0x20001000)
+            #for x in range(0, 64):
+            #    hardware.write_memory(x, 4, 0x2000124d)
+            l.info("Injecting the magic interrupt stub")
+            avatar.enable_interrupts(hardware, qemu)
+            hardware.protocols.interrupts.inject_monitor_stub()
+            l.warning("Hold onto your butt, starting the target in the stub")
+            ## TODO: FIXME: HACK: This is a hack.  It's catchy.  You like it.
+            hardware.remove_breakpoint(0)
+            hardware.remove_breakpoint(1)
+            hardware.remove_breakpoint(2)
+            hardware.set_breakpoint(hardware.protocols.interrupts.get_isr(20))
+            hardware.cont()
+            # For CM0 and other devices with a fixed IVT, QEMU has to know about it
+            if 'ivt_address' in args.__dict__ and args.ivt_address is not None:
+                l.warning("Setting QEMU interrupt table to %#08x" % args.ivt_address)
+                qemu.protocols.interrupts.set_vector_table_base(args.ivt_address)
+        # Set our program counter
+        qemu.regs.pc = bin_parser.get_entry_point()
+        qemu.regs.sp = bin_parser.get_initial_sp()
+
+        # Record our start time
+        time_start = time.time()
+        # Update our memory log
+        memory_log = LogWriter(os.path.join(args.output_dir,
+                                            "recording%d.%s" % (
+                                                run, G.RECORDING_EXTENSION)))
+
+        # Do the thing, whichever thing it is
+        if args.shell:
+            import IPython
+
+            IPython.embed()
+        else:
+            qemu.cont()
+            l.info("Running and recording for a bit")
+            time.sleep(args.sleep_time)
+            # qemu.wait()
+
+            l.info("All done. Stopping emulator")
+        if stim_proc:
+            l.info("Stopping stimulator")
+            stim_proc.shutdown()
+        qemu.stop()
+        if args.interrupts:
+            try:
+                l.info("Stopping target")
+                hardware.stop()
+            except:
+                pass
+
+        l.info("Shutting down Avatar...")
+        avatar.shutdown()
+        if G.COVERAGE_LOG:
+            blocks = get_hit_blocks(G.COVERAGE_LOG)
+            print "Hit blocks:", repr(blocks)
+            print "Hit %d blocks" % len(blocks)
+    if memory_log:
+        memory_log.close()
+
+"""
+Notes:
+Manipulate LED
+on: nucleo.write_memory(0x40020018, 2, 32)
+off: nucleo.write_memory(0x40020028, 2, 32)
+"""

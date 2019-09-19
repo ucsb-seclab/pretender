@@ -1,0 +1,10 @@
+# This is an mbed eval board with a single NXP LPC11U24 chip.
+# http://mbed.org/handbook/mbed-NXP-LPC11U24
+#
+
+source [find interface/cmsis-dap.cfg]
+
+# NXP LPC11U68 Cortex-M0 with 256kB Flash and 36kB SRAM
+set WORKAREASIZE 0x8000
+
+source [find target/lpc11xx.cfg]

@@ -36,11 +36,11 @@ https://github.com/avatartwo/avatar2
 
 * OpenOCD:
 Use git version `edb6796`
-Never versions introduce bugs regarding breakpoints over STLink devices (and therefore cause interrupt recording issues on STM32 devices)
+Newer versions introduce bugs regarding breakpoints over STLink devices (and therefore cause interrupt recording issues on STM32 devices)
 
 * arm-none-eabi-gdb 
 We used version `7.10-1` shipped with Ubuntu 16.04.
-Never versions cause tons of Avatar-related issues we haven't been able to track down.
+Newer versions cause tons of Avatar-related issues we haven't been able to track down.
 
 * arm-none-eabi-gcc (to compile the examples if needed)
 We used version  `4.9.3 20150529` shipped with Ubuntu 16.04.  Newer versions are known to break compilation, likely due to bugs in the included version of the libmbed build scripts.

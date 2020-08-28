@@ -10,15 +10,14 @@ This directory is laid out as follows:
  - *bin*: Core binaries for Pretender use for recording, training, and replaying
  
 # Installation
-First, install the dependencies
-```bash
-./scripts/install_dependencies.sh
-```
 
-
-Then, install the python package
+Pretender can be installed like other Python packages, e.g. via
 ```bash
 sudo python setup.py install
+```
+or
+```bash
+pip install -e .
 ```
 
 # Example Usage
